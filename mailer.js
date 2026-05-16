@@ -1,0 +1,82 @@
+import nodemailer from 'nodemailer';
+
+let transporter = null;
+let usingEthereal = false;
+
+async function getTransporter() {
+  if (transporter) return transporter;
+
+  if (process.env.SMTP_HOST) {
+    transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: process.env.SMTP_SECURE === 'true',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    console.log(`✉  Mailer: ${process.env.SMTP_HOST}`);
+    return transporter;
+  }
+
+  try {
+    const test = await nodemailer.createTestAccount();
+    transporter = nodemailer.createTransport({
+      host: test.smtp.host, port: test.smtp.port, secure: test.smtp.secure,
+      auth: { user: test.user, pass: test.pass },
+    });
+    usingEthereal = true;
+    console.log(`✉  Mailer: Ethereal (dev) — mailler https://ethereal.email/messages adresində görünür`);
+    return transporter;
+  } catch {
+    console.warn('⚠  Mailer disabled (no SMTP, no Ethereal). Codes will print to console.');
+    transporter = null;
+    return null;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+export async function sendPasswordResetCode(to, name, code) {
+  const tr = await getTransporter();
+
+  if (!tr) {
+    console.log(`\n🔑 [DEV] Password reset code for ${to}: ${code}\n`);
+    return { previewUrl: null };
+  }
+
+  const html = `
+    <div style="font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 32px 24px; color: #1e293b;">
+      <div style="text-align: center; margin-bottom: 32px;">
+        <div style="display: inline-block; width: 56px; height: 56px; background: linear-gradient(135deg, #4f46e5, #7c3aed); border-radius: 14px; line-height: 56px; color: white; font-size: 28px; font-weight: 800;">E</div>
+      </div>
+      <h1 style="font-size: 22px; font-weight: 700; color: #0f172a; margin: 0 0 12px;">Şifrə bərpa kodu</h1>
+      <p style="font-size: 15px; line-height: 1.6; color: #475569; margin: 0 0 24px;">
+        Salam <strong>${escapeHtml(name)}</strong>,<br>
+        Şifrənizi bərpa etmək üçün aşağıdakı 6 rəqəmli kodu istifadə edin:
+      </p>
+      <div style="text-align: center; margin: 32px 0;">
+        <div style="display: inline-block; font-size: 36px; font-weight: 800; letter-spacing: 12px; background: #f1f5f9; color: #4f46e5; padding: 20px 32px; border-radius: 16px; border: 2px solid #e0e7ff;">
+          ${escapeHtml(code)}
+        </div>
+      </div>
+      <p style="font-size: 13px; color: #64748b; line-height: 1.6;">
+        Bu kod <strong>15 dəqiqə</strong> ərzində etibarlıdır. Əgər siz bu sorğunu göndərməmisinizsə, bu maili nəzərə almayın.
+      </p>
+      <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 32px 0;">
+      <p style="font-size: 12px; color: #94a3b8; text-align: center; margin: 0;">
+        EduGate · Təhlükəsizliyiniz üçün bu kodu heç kimlə paylaşmayın.
+      </p>
+    </div>
+  `;
+
+  const info = await tr.sendMail({
+    from: process.env.MAIL_FROM || '"EduGate" <noreply@edugate.local>',
+    to, subject: 'EduGate — Şifrə bərpa kodu', html,
+  });
+
+  console.log(`📧 Reset kodu göndərildi → ${to} · kod: ${code}`);
+  const previewUrl = usingEthereal ? nodemailer.getTestMessageUrl(info) : null;
+  if (previewUrl) console.log(`   Preview: ${previewUrl}`);
+  return { previewUrl };
+}

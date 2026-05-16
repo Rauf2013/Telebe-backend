@@ -1,0 +1,517 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import { randomUUID } from 'crypto';
+import { join, dirname, extname } from 'path';
+import { fileURLToPath } from 'url';
+import { users, applications, notifications, invites, events, passwordResets, stats } from './db.js';
+import { sendPasswordResetCode } from './mailer.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const app = express();
+const PORT = process.env.PORT || 4000;
+const JWT_SECRET = process.env.JWT_SECRET || 'edugate-dev-secret-change-in-prod';
+
+app.use(cors());
+app.use(express.json({ limit: '5mb' }));
+app.use('/uploads', express.static(join(__dirname, 'uploads')));
+
+/* ---------- multer (file uploads) ---------- */
+const storage = multer.diskStorage({
+  destination: join(__dirname, 'uploads'),
+  filename: (_req, file, cb) => cb(null, `${randomUUID()}${extname(file.originalname)}`),
+});
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
+
+/* ---------- auth helpers ---------- */
+function publicUser(u) {
+  if (!u) return null;
+  const { password: _pw, ...rest } = u;
+  return rest;
+}
+
+function sign(user) {
+  return jwt.sign(publicUser(user), JWT_SECRET, { expiresIn: '7d' });
+}
+
+function authRequired(roles = []) {
+  return (req, res, next) => {
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'no_token' });
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      if (roles.length && !roles.includes(payload.role)) return res.status(403).json({ error: 'forbidden' });
+      req.user = payload;
+      next();
+    } catch {
+      res.status(401).json({ error: 'invalid_token' });
+    }
+  };
+}
+
+/* ---------- AUTH ---------- */
+app.post('/api/auth/register', async (req, res) => {
+  const { email, password, fullName, role, phone, whatsapp, universityId } = req.body || {};
+  if (!email || !password || !fullName || !role) return res.status(400).json({ error: 'missing_fields' });
+  if (role !== 'student' && role !== 'university') return res.status(403).json({ error: 'forbidden_role' });
+  if (users.findByEmail(email)) return res.status(409).json({ error: 'email_exists' });
+  if (password.length < 6) return res.status(400).json({ error: 'weak_password' });
+
+  const hash = await bcrypt.hash(password, 10);
+  let user = users.create({
+    id: randomUUID(),
+    email, password: hash, fullName, role, phone, whatsapp, universityId,
+    createdAt: new Date().toISOString(),
+  });
+  users.markEmailVerified(user.id);
+  user = users.findById(user.id);
+  res.json({ user: publicUser(user), token: sign(user) });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  const user = users.findByEmail(email || '');
+  if (!user) return res.status(401).json({ error: 'invalid_credentials' });
+  const ok = await bcrypt.compare(password, user.password);
+  if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
+  res.json({ user: publicUser(user), token: sign(user) });
+});
+
+app.get('/api/auth/me', authRequired(), (req, res) => {
+  const user = users.findById(req.user.id);
+  res.json({ user: publicUser(user) });
+});
+
+/* ---------- PASSWORD RESET ---------- */
+function generate6DigitCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+// 1. Kod gönder
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'missing_email' });
+
+  const user = users.findByEmail(email);
+  // Güvenlik: kullanıcı var mı yok mu sızdırma — her halükarda OK dön
+  if (user) {
+    const code = generate6DigitCode();
+    passwordResets.upsert({ email: user.email, userId: user.id, code });
+    try {
+      await sendPasswordResetCode(user.email, user.fullName, code);
+    } catch (err) {
+      console.error('Reset mail failed:', err.message);
+    }
+  }
+  res.json({ ok: true });
+});
+
+// 2a. Sadece kodu doğrula (tüketmez) — UI ilk adımda kullanır
+app.post('/api/auth/verify-reset-code', (req, res) => {
+  const { email, code } = req.body || {};
+  if (!email || !code) return res.status(400).json({ error: 'missing_fields' });
+
+  const reset = passwordResets.find(email);
+  if (!reset) return res.status(400).json({ error: 'invalid_code' });
+  if (new Date(reset.expiresAt) < new Date()) {
+    passwordResets.consume(email);
+    return res.status(400).json({ error: 'expired_code' });
+  }
+  if (reset.attempts >= 5) {
+    passwordResets.consume(email);
+    return res.status(429).json({ error: 'too_many_attempts' });
+  }
+  const submitted = String(code).replace(/\s+/g, '').trim();
+  if (reset.code !== submitted) {
+    passwordResets.incrementAttempts(email);
+    console.log(`⚠ Yanlış kod: gözlənilən "${reset.code}", gələn "${submitted}"`);
+    return res.status(400).json({ error: 'invalid_code' });
+  }
+  res.json({ ok: true });
+});
+
+// 2b. Kod doğrula + yeni şifre ayarla
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { email, code, newPassword } = req.body || {};
+  if (!email || !code || !newPassword) return res.status(400).json({ error: 'missing_fields' });
+  if (newPassword.length < 6) return res.status(400).json({ error: 'weak_password' });
+
+  const reset = passwordResets.find(email);
+  if (!reset) return res.status(400).json({ error: 'invalid_code' });
+  if (new Date(reset.expiresAt) < new Date()) {
+    passwordResets.consume(email);
+    return res.status(400).json({ error: 'expired_code' });
+  }
+  if (reset.attempts >= 5) {
+    passwordResets.consume(email);
+    return res.status(429).json({ error: 'too_many_attempts' });
+  }
+  const submitted2 = String(code).replace(/\s+/g, '').trim();
+  if (reset.code !== submitted2) {
+    passwordResets.incrementAttempts(email);
+    return res.status(400).json({ error: 'invalid_code' });
+  }
+
+  // Şifreyi güncelle, reset kaydını sil
+  const hash = await bcrypt.hash(newPassword, 10);
+  users.updatePassword(reset.userId, hash);
+  passwordResets.consume(email);
+
+  res.json({ ok: true });
+});
+
+app.patch('/api/auth/me', authRequired(), (req, res) => {
+  const { fullName, phone, whatsapp } = req.body || {};
+  if (!fullName) return res.status(400).json({ error: 'missing_fields' });
+  const user = users.updateProfile(req.user.id, { fullName, phone, whatsapp });
+  res.json({ user: publicUser(user), token: sign(user) });
+});
+
+app.post('/api/auth/password', authRequired(), async (req, res) => {
+  const { current, next } = req.body || {};
+  if (!current || !next || next.length < 6) return res.status(400).json({ error: 'invalid_input' });
+  const user = users.findById(req.user.id);
+  const ok = await bcrypt.compare(current, user.password);
+  if (!ok) return res.status(401).json({ error: 'wrong_password' });
+  users.updatePassword(req.user.id, await bcrypt.hash(next, 10));
+  res.json({ ok: true });
+});
+
+/* ---------- NOTIFICATIONS ---------- */
+function notify(userId, type, title, message, link) {
+  notifications.create({ id: randomUUID(), userId, type, title, message, link });
+}
+
+/* ---------- EVENT LOG helper ---------- */
+function logEvent(applicationId, actor, type, message) {
+  events.create({
+    applicationId,
+    actorId: actor?.id,
+    actorRole: actor?.role,
+    type, message,
+  });
+}
+
+app.get('/api/notifications', authRequired(), (req, res) => {
+  res.json({
+    notifications: notifications.listByUser(req.user.id),
+    unread: notifications.unreadCount(req.user.id),
+  });
+});
+
+app.post('/api/notifications/:id/read', authRequired(), (req, res) => {
+  notifications.markRead(req.params.id, req.user.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/notifications/read-all', authRequired(), (req, res) => {
+  notifications.markAllRead(req.user.id);
+  res.json({ ok: true });
+});
+
+/* ---------- USERS ---------- */
+app.get('/api/users/:id', authRequired(), (req, res) => {
+  const user = users.findById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'not_found' });
+  res.json({ user: publicUser(user) });
+});
+
+app.get('/api/users', authRequired(['moderator', 'university']), (_req, res) => {
+  res.json({ users: users.list().map(publicUser) });
+});
+
+/* ---------- ADMIN: Moderator yönetimi ---------- */
+app.get('/api/admin/moderators', authRequired(['moderator']), (_req, res) => {
+  const list = users.list().filter(u => u.role === 'moderator').map(publicUser);
+  res.json({ moderators: list });
+});
+
+app.post('/api/admin/moderators', authRequired(['moderator']), async (req, res) => {
+  const { email, password, fullName, phone } = req.body || {};
+  if (!email || !password || !fullName) return res.status(400).json({ error: 'missing_fields' });
+  if (password.length < 6) return res.status(400).json({ error: 'weak_password' });
+  if (users.findByEmail(email)) return res.status(409).json({ error: 'email_exists' });
+
+  const hash = await bcrypt.hash(password, 10);
+  const user = users.create({
+    id: randomUUID(),
+    email, password: hash, fullName, role: 'moderator', phone,
+    createdAt: new Date().toISOString(),
+  });
+  users.markEmailVerified(user.id);
+  res.json({ moderator: publicUser(users.findById(user.id)) });
+});
+
+/* ---------- MODERATOR INVITE SYSTEM ---------- */
+// Moderator davet linki oluştur
+app.post('/api/admin/invites', authRequired(['moderator']), (req, res) => {
+  const { note } = req.body || {};
+  const inv = invites.create({ createdBy: req.user.id, note });
+  res.json({ invite: inv });
+});
+
+// Mevcut davetleri listele
+app.get('/api/admin/invites', authRequired(['moderator']), (_req, res) => {
+  res.json({ invites: invites.listAll() });
+});
+
+// Daveti sil/iptal et
+app.delete('/api/admin/invites/:token', authRequired(['moderator']), (req, res) => {
+  invites.delete(req.params.token);
+  res.json({ ok: true });
+});
+
+// Public: davet token doğrulama (UI için)
+app.get('/api/invites/:token', (req, res) => {
+  const inv = invites.find(req.params.token);
+  if (!inv) return res.status(404).json({ error: 'invalid_token' });
+  if (inv.usedAt) return res.status(410).json({ error: 'already_used' });
+  if (new Date(inv.expiresAt) < new Date()) return res.status(410).json({ error: 'expired' });
+  res.json({ ok: true, expiresAt: inv.expiresAt, note: inv.note });
+});
+
+// Public: daveti kabul et — moderator hesabı yarat
+app.post('/api/invites/:token/accept', async (req, res) => {
+  const { email, password, fullName, phone } = req.body || {};
+  if (!email || !password || !fullName) return res.status(400).json({ error: 'missing_fields' });
+  if (password.length < 6) return res.status(400).json({ error: 'weak_password' });
+
+  const inv = invites.find(req.params.token);
+  if (!inv) return res.status(404).json({ error: 'invalid_token' });
+  if (inv.usedAt) return res.status(410).json({ error: 'already_used' });
+  if (new Date(inv.expiresAt) < new Date()) return res.status(410).json({ error: 'expired' });
+  if (users.findByEmail(email)) return res.status(409).json({ error: 'email_exists' });
+
+  const hash = await bcrypt.hash(password, 10);
+  const user = users.create({
+    id: randomUUID(),
+    email, password: hash, fullName, role: 'moderator', phone,
+    createdAt: new Date().toISOString(),
+  });
+  users.markEmailVerified(user.id);
+  invites.consume(req.params.token, user.id);
+  res.json({ user: publicUser(user), token: sign(user) });
+});
+
+/* ---------- APPLICATIONS — STUDENT ---------- */
+app.get('/api/applications/mine', authRequired(['student']), (req, res) => {
+  res.json({ application: applications.findByStudent(req.user.id) ?? null });
+});
+
+app.post('/api/applications/choices', authRequired(['student']), (req, res) => {
+  const { choices } = req.body || {};
+  if (!Array.isArray(choices) || choices.length > 5) return res.status(400).json({ error: 'invalid_choices' });
+
+  let app = applications.findByStudent(req.user.id);
+  const isNew = !app;
+  if (app) {
+    app.choices = choices;
+    app = applications.save(app);
+  } else {
+    app = applications.create({
+      id: randomUUID(),
+      studentId: req.user.id,
+      status: 'draft',
+      choices,
+      documents: [],
+      firstPaymentPaid: false,
+      secondPaymentPaid: false,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  logEvent(app.id, req.user, isNew ? 'created' : 'choices_updated',
+    isNew ? `Müraciət yaradıldı (${choices.length} fakultə seçildi)` : `Fakultə seçimi yeniləndi (${choices.length} fakultə)`);
+  res.json({ application: app });
+});
+
+app.post('/api/applications/documents', authRequired(['student']), upload.single('file'), (req, res) => {
+  const { type } = req.body;
+  if (!req.file || !type) return res.status(400).json({ error: 'missing_fields' });
+
+  const app = applications.findByStudent(req.user.id);
+  if (!app) return res.status(404).json({ error: 'no_application' });
+
+  app.documents.push({
+    id: randomUUID(), type,
+    fileName: req.file.originalname,
+    url: `/uploads/${req.file.filename}`,
+    uploadedAt: new Date().toISOString(),
+  });
+  const saved = applications.save(app);
+  logEvent(app.id, req.user, 'document_uploaded', `Sənəd yükləndi: ${type}`);
+  res.json({ application: saved });
+});
+
+app.delete('/api/applications/documents/:docId', authRequired(['student']), (req, res) => {
+  const app = applications.findByStudent(req.user.id);
+  if (!app) return res.status(404).json({ error: 'no_application' });
+  app.documents = app.documents.filter(d => d.id !== req.params.docId);
+  res.json({ application: applications.save(app) });
+});
+
+app.post('/api/applications/payment/first', authRequired(['student']), (req, res) => {
+  const app = applications.findByStudent(req.user.id);
+  if (!app) return res.status(404).json({ error: 'no_application' });
+  app.firstPaymentPaid = true;
+  app.status = 'in_translation';
+  const saved = applications.save(app);
+  logEvent(app.id, req.user, 'first_payment', 'İlk ödəniş tamamlandı ($150)');
+  users.list().filter(u => u.role === 'moderator').forEach(m =>
+    notify(m.id, 'payment',
+      'Yeni ödəniş alındı',
+      `${users.findById(req.user.id)?.fullName} ilk ödənişi tamamladı. Sənədlər tərcüməyə hazırdır.`,
+      '/moderator')
+  );
+  res.json({ application: saved });
+});
+
+app.post('/api/applications/payment/second', authRequired(['student']), (req, res) => {
+  const app = applications.findByStudent(req.user.id);
+  if (!app) return res.status(404).json({ error: 'no_application' });
+  app.secondPaymentPaid = true;
+  app.status = 'completed';
+  const saved = applications.save(app);
+  logEvent(app.id, req.user, 'second_payment', 'İkinci ödəniş tamamlandı ($350) — müraciət bağlandı');
+  users.list().filter(u => u.role === 'moderator').forEach(m =>
+    notify(m.id, 'payment',
+      'İkinci ödəniş alındı',
+      `${users.findById(req.user.id)?.fullName} ikinci ödənişi tamamladı. Müraciət tamamlandı.`,
+      '/moderator')
+  );
+  res.json({ application: saved });
+});
+
+/* ---------- APPLICATIONS — MODERATOR ---------- */
+app.get('/api/applications', authRequired(['moderator']), (_req, res) => {
+  res.json({ applications: applications.list() });
+});
+
+app.post('/api/applications/:id/documents/:docId/translation',
+  authRequired(['moderator']), upload.single('file'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'missing_file' });
+    const app = applications.findById(req.params.id);
+    if (!app) return res.status(404).json({ error: 'not_found' });
+    const doc = app.documents.find(d => d.id === req.params.docId);
+    if (!doc) return res.status(404).json({ error: 'doc_not_found' });
+    doc.translatedUrl = `/uploads/${req.file.filename}`;
+    const saved = applications.save(app);
+    logEvent(app.id, req.user, 'translation_uploaded', `Tərcümə yükləndi: ${doc.type}`);
+    notify(app.studentId, 'translation',
+      'Sənədinizin tərcüməsi hazırdır',
+      `"${doc.type}" sənədi tərcümə edildi.`,
+      '/student');
+    res.json({ application: saved });
+  }
+);
+
+/* ---------- choice status change (mod + uni) ---------- */
+app.post('/api/applications/:id/choices/:facultyId/status',
+  authRequired(['moderator', 'university']), (req, res) => {
+    const { status, tuitionFee, notes } = req.body || {};
+    const allowed = {
+      moderator:  ['under_review', 'sent_to_university', 'in_translation'],
+      university: ['approved', 'rejected'],
+    };
+    if (!allowed[req.user.role].includes(status))
+      return res.status(403).json({ error: 'forbidden_status' });
+
+    const app = applications.findById(req.params.id);
+    if (!app) return res.status(404).json({ error: 'not_found' });
+    const choice = app.choices.find(c => c.facultyId === req.params.facultyId);
+    if (!choice) return res.status(404).json({ error: 'choice_not_found' });
+
+    // university reps can only act on their own university's choices
+    if (req.user.role === 'university' && choice.universityId !== req.user.universityId)
+      return res.status(403).json({ error: 'wrong_university' });
+
+    choice.status = status;
+    if (tuitionFee != null) choice.tuitionFee = Number(tuitionFee);
+    if (notes != null) choice.notes = notes;
+
+    const saved = applications.save(app);
+
+    // Timeline
+    const statusLabels = {
+      under_review: 'Universitetə göndərildi',
+      sent_to_university: 'Universitetə göndərildi',
+      in_translation: 'Tərcüməyə qaytarıldı',
+      approved: 'Qəbul təsdiqləndi',
+      rejected: 'Müraciət geri qaytarıldı',
+    };
+    logEvent(app.id, req.user, `status_${status}`, statusLabels[status] || status);
+
+    // Bildirimler
+    if (req.user.role === 'moderator' && status === 'under_review') {
+      // Üniversite temsilcilerine bildir
+      users.list().filter(u => u.role === 'university' && u.universityId === choice.universityId)
+        .forEach(rep => notify(rep.id, 'application',
+          'Yeni müraciət',
+          'Sizin universitetinizə yeni bir tələbə müraciəti gəldi.',
+          '/university'));
+    } else if (req.user.role === 'university') {
+      // Moderatorlara bildir
+      const studentName = users.findById(app.studentId)?.fullName ?? 'Tələbə';
+      users.list().filter(u => u.role === 'moderator').forEach(m =>
+        notify(m.id, 'decision',
+          status === 'approved' ? 'Qəbul təsdiqləndi' : 'Müraciət rədd edildi',
+          `${studentName} üçün qərar verildi.`,
+          '/moderator')
+      );
+      // Öğrenciye de bildir (sadece status, harç bilgisi vermez)
+      notify(app.studentId, 'decision',
+        status === 'approved' ? '🎉 Qəbul oldunuz!' : 'Müraciətiniz haqqında',
+        status === 'approved'
+          ? 'Seçilmiş fakultənizə qəbul oldunuz. Detallar üçün kabinetinizə baxın.'
+          : 'Müraciətinizin nəticəsi haqqında məlumat kabinetinizdədir.',
+        '/student');
+    }
+
+    res.json({ application: saved });
+  }
+);
+
+/* ---------- TIMELINE ---------- */
+// Student kendi başvurusunun timeline'ını görür; moderator herhangi birini görür.
+// University rep, kendi üniversitesine ait choice olan bir başvuruyu görebilir.
+app.get('/api/applications/:id/events', authRequired(), (req, res) => {
+  const app = applications.findById(req.params.id);
+  if (!app) return res.status(404).json({ error: 'not_found' });
+  if (req.user.role === 'student' && app.studentId !== req.user.id)
+    return res.status(403).json({ error: 'forbidden' });
+  if (req.user.role === 'university') {
+    const owns = app.choices.some(c => c.universityId === req.user.universityId);
+    if (!owns) return res.status(403).json({ error: 'forbidden' });
+  }
+  res.json({ events: events.listByApp(req.params.id) });
+});
+
+/* ---------- STATS ---------- */
+app.get('/api/stats', (_req, res) => res.json(stats()));
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+/* ---------- Seed initial moderator on first boot ---------- */
+async function seedModerator() {
+  const existing = users.list().filter(u => u.role === 'moderator');
+  if (existing.length > 0) return;
+  const email = process.env.ADMIN_EMAIL    || 'admin@edugate.local';
+  const pass  = process.env.ADMIN_PASSWORD || 'admin123';
+  const name  = process.env.ADMIN_NAME     || 'System Administrator';
+  const hash = await bcrypt.hash(pass, 10);
+  const u = users.create({
+    id: randomUUID(),
+    email, password: hash, fullName: name, role: 'moderator',
+    createdAt: new Date().toISOString(),
+  });
+  users.markEmailVerified(u.id);
+  console.log(`✓ Seeded moderator: ${email} / ${pass}`);
+}
+
+await seedModerator();
+
+app.listen(PORT, () => {
+  console.log(`EduGate API → http://localhost:${PORT}`);
+});
