@@ -125,15 +125,65 @@ export async function sendUniInviteLink(to, name, link, universityName) {
   return { previewUrl };
 }
 
-/* ---------- SMS OTP (DEV: console only; production should plug an SMS API here) ---------- */
-export async function sendSmsOtp(phone, code) {
-  // In production wire Twilio / AWS SNS / etc. here using env credentials.
-  // For dev we always log the code so QA can complete signup without a real SMS gateway.
-  if (process.env.SMS_PROVIDER) {
-    console.log(`📱 [SMS via ${process.env.SMS_PROVIDER}] → ${phone} · ${code}`);
-    // No real send implemented here — placeholder hook for prod integration.
-  } else {
-    console.log(`\n📱 [DEV SMS] OTP code for ${phone}: ${code}\n`);
+/* ---------- SMS (Twilio in prod, console in dev) ----------
+   Configure via .env:
+     SMS_PROVIDER=twilio
+     TWILIO_ACCOUNT_SID=AC...
+     TWILIO_AUTH_TOKEN=...
+     TWILIO_FROM=+15551234567
+   If SMS_PROVIDER is anything else (or unset) we just log to the server console.
+-------------------------------------------------------------- */
+let twilioClient = null;
+let twilioInitErr = null;
+
+async function getTwilioClient() {
+  if (twilioClient || twilioInitErr) return twilioClient;
+  if (process.env.SMS_PROVIDER !== 'twilio') return null;
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_FROM) {
+    twilioInitErr = 'twilio_env_missing';
+    console.warn('⚠  Twilio configured but TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM is missing.');
+    return null;
   }
-  return { ok: true };
+  try {
+    const { default: Twilio } = await import('twilio');
+    twilioClient = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    console.log(`📱 SMS: Twilio (from ${process.env.TWILIO_FROM})`);
+    return twilioClient;
+  } catch (e) {
+    twilioInitErr = e.message;
+    console.warn('⚠  Twilio SDK not installed. Run: npm install twilio   |   error:', e.message);
+    return null;
+  }
+}
+
+/** Generic SMS send. Falls back to console.log if no provider is configured. */
+export async function sendSms(to, body) {
+  if (!to) return { ok: false, error: 'no_recipient' };
+  const client = await getTwilioClient();
+  if (!client) {
+    console.log(`\n📱 [DEV SMS] → ${to}\n   ${body}\n`);
+    return { ok: true, dev: true };
+  }
+  try {
+    const msg = await client.messages.create({
+      from: process.env.TWILIO_FROM,
+      to,
+      body,
+    });
+    console.log(`📱 SMS göndərildi → ${to} (sid: ${msg.sid})`);
+    return { ok: true, sid: msg.sid };
+  } catch (e) {
+    console.error(`SMS send failed (${to}):`, e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+/** Registration OTP: short body, just the code + a nudge not to share it. */
+export async function sendSmsOtp(phone, code) {
+  return sendSms(phone, `EduGate: təsdiq kodunuz ${code}. Heç kimlə paylaşmayın.`);
+}
+
+/** Password reset OTP variant — wording differs slightly for clarity. */
+export async function sendPasswordResetSms(phone, code) {
+  return sendSms(phone, `EduGate: şifrə bərpa kodunuz ${code}. 15 dəqiqə etibarlıdır.`);
 }

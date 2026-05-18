@@ -8,7 +8,7 @@ import { randomUUID } from 'crypto';
 import { join, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
 import { users, applications, notifications, invites, events, passwordResets, phoneVerifications, stats } from './db.js';
-import { sendPasswordResetCode, sendUniInviteLink, sendSmsOtp } from './mailer.js';
+import { sendPasswordResetCode, sendUniInviteLink, sendSmsOtp, sendPasswordResetSms } from './mailer.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -167,20 +167,23 @@ function generate6DigitCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-// 1. Kod gönder
+// 1. Send the 6-digit code via email AND SMS (when the user has a phone on file).
+//    Same code works on both channels — user enters whichever they receive first.
 app.post('/api/auth/forgot-password', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'missing_email' });
 
   const user = users.findByEmail(email);
-  // Güvenlik: kullanıcı var mı yok mu sızdırma — her halükarda OK dön
+  // Security: never leak whether the email exists — always respond OK.
   if (user) {
     const code = generate6DigitCode();
     passwordResets.upsert({ email: user.email, userId: user.id, code });
-    try {
-      await sendPasswordResetCode(user.email, user.fullName, code);
-    } catch (err) {
-      console.error('Reset mail failed:', err.message);
+    // Fire-and-forget both channels. Failures are logged but don't break the response.
+    try { await sendPasswordResetCode(user.email, user.fullName, code); }
+    catch (err) { console.error('Reset mail failed:', err.message); }
+    if (user.phone) {
+      try { await sendPasswordResetSms(user.phone, code); }
+      catch (err) { console.error('Reset SMS failed:', err.message); }
     }
   }
   res.json({ ok: true });
