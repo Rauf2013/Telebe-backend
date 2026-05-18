@@ -342,11 +342,16 @@ export const applications = {
   },
 };
 
-/* ---------- PASSWORD RESETS ---------- */
+/* ---------- PASSWORD RESETS ----------
+   Token-based flow: we email the user a long random token in a link.
+   We store it in the `code` column (legacy name, holds the full token now).
+   The `attempts` column is unused for tokens (only meaningful for 6-digit codes)
+   but kept so older DBs continue to work without schema changes.
+---------------------------------------- */
 export const passwordResets = {
-  upsert({ email, userId, code }) {
+  upsert({ email, userId, token, ttlMin = 60 }) {
     const now = new Date();
-    const expires = new Date(now.getTime() + 15 * 60 * 1000); // 15 dəqiqə
+    const expires = new Date(now.getTime() + ttlMin * 60 * 1000); // 1 hour by default
     db.prepare(`
       INSERT INTO password_resets (email, code, user_id, attempts, expires_at, created_at)
       VALUES (?, ?, ?, 0, ?, ?)
@@ -356,25 +361,29 @@ export const passwordResets = {
         attempts = 0,
         expires_at = excluded.expires_at,
         created_at = excluded.created_at
-    `).run(email.toLowerCase(), code, userId, expires.toISOString(), now.toISOString());
+    `).run(email.toLowerCase(), token, userId, expires.toISOString(), now.toISOString());
     return { expiresAt: expires.toISOString() };
   },
-  find(email) {
+  findByEmail(email) {
     const r = db.prepare(`SELECT * FROM password_resets WHERE email = ?`).get(email.toLowerCase());
-    if (!r) return null;
-    return {
-      email: r.email, code: r.code, userId: r.user_id, attempts: r.attempts,
-      expiresAt: r.expires_at, createdAt: r.created_at,
-    };
+    return r ? rowToReset(r) : null;
   },
-  incrementAttempts(email) {
-    db.prepare(`UPDATE password_resets SET attempts = attempts + 1 WHERE email = ?`)
-      .run(email.toLowerCase());
+  // Lookup by token — this is what the link click handler uses, since the URL only carries the token.
+  findByToken(token) {
+    const r = db.prepare(`SELECT * FROM password_resets WHERE code = ?`).get(token);
+    return r ? rowToReset(r) : null;
   },
-  consume(email) {
-    db.prepare(`DELETE FROM password_resets WHERE email = ?`).run(email.toLowerCase());
+  consume(token) {
+    db.prepare(`DELETE FROM password_resets WHERE code = ?`).run(token);
   },
 };
+
+function rowToReset(r) {
+  return {
+    email: r.email, token: r.code, userId: r.user_id, attempts: r.attempts,
+    expiresAt: r.expires_at, createdAt: r.created_at,
+  };
+}
 
 /* ---------- NOTIFICATIONS ---------- */
 function rowToNotif(r) {

@@ -8,7 +8,7 @@ import { randomUUID } from 'crypto';
 import { join, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
 import { users, applications, notifications, invites, events, passwordResets, phoneVerifications, stats } from './db.js';
-import { sendPasswordResetCode, sendUniInviteLink, sendSmsOtp, sendPasswordResetSms } from './mailer.js';
+import { sendPasswordResetLink, sendUniInviteLink, sendSmsOtp } from './mailer.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -162,83 +162,69 @@ app.get('/api/auth/me', authRequired(), (req, res) => {
   res.json({ user: publicUser(user) });
 });
 
-/* ---------- PASSWORD RESET ---------- */
-function generate6DigitCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+/* ---------- PASSWORD RESET (link-based) ----------
+   1) Client posts an email → we email a one-time link with a long random token.
+   2) User clicks the link → frontend hits /verify-reset-token to render the form
+      only if the token is still valid (not expired, not used).
+   3) User submits a new password → /reset-password consumes the token and updates.
+   No 6-digit codes anywhere — losing the email = restart the flow.
+--------------------------------------------------------- */
+
+// Long URL-safe random token. 48 hex chars = 192 bits of entropy — way more than enough.
+function makeResetToken() {
+  const bytes = new Uint8Array(24);
+  (globalThis.crypto || require('crypto').webcrypto).getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 1. Send the 6-digit code via email AND SMS (when the user has a phone on file).
-//    Same code works on both channels — user enters whichever they receive first.
+// 1) Send reset link via email. We never confirm whether the email exists.
 app.post('/api/auth/forgot-password', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'missing_email' });
 
   const user = users.findByEmail(email);
-  // Security: never leak whether the email exists — always respond OK.
   if (user) {
-    const code = generate6DigitCode();
-    passwordResets.upsert({ email: user.email, userId: user.id, code });
-    // Fire-and-forget both channels. Failures are logged but don't break the response.
-    try { await sendPasswordResetCode(user.email, user.fullName, code); }
+    const token = makeResetToken();
+    passwordResets.upsert({ email: user.email, userId: user.id, token });
+    // The link points at the frontend, not the API. APP_URL or FRONTEND_URL can override
+    // the default of localhost:5173 (e.g. when running behind a tunnel or in production).
+    const origin = (process.env.APP_URL || process.env.FRONTEND_URL || `${req.protocol}://${req.get('host').replace(/:\d+$/, ':5173')}`).replace(/\/$/, '');
+    const link = `${origin}/reset-password/${token}`;
+    try { await sendPasswordResetLink(user.email, user.fullName, link); }
     catch (err) { console.error('Reset mail failed:', err.message); }
-    if (user.phone) {
-      try { await sendPasswordResetSms(user.phone, code); }
-      catch (err) { console.error('Reset SMS failed:', err.message); }
-    }
   }
   res.json({ ok: true });
 });
 
-// 2a. Sadece kodu doğrula (tüketmez) — UI ilk adımda kullanır
-app.post('/api/auth/verify-reset-code', (req, res) => {
-  const { email, code } = req.body || {};
-  if (!email || !code) return res.status(400).json({ error: 'missing_fields' });
-
-  const reset = passwordResets.find(email);
-  if (!reset) return res.status(400).json({ error: 'invalid_code' });
+// 2) GET /verify-reset-token/:token — read-only check used by the page to decide
+//    whether to render the password form or an "expired" message.
+app.get('/api/auth/verify-reset-token/:token', (req, res) => {
+  const reset = passwordResets.findByToken(req.params.token);
+  if (!reset) return res.status(404).json({ error: 'invalid_token' });
   if (new Date(reset.expiresAt) < new Date()) {
-    passwordResets.consume(email);
-    return res.status(400).json({ error: 'expired_code' });
+    passwordResets.consume(reset.token);
+    return res.status(410).json({ error: 'expired_token' });
   }
-  if (reset.attempts >= 5) {
-    passwordResets.consume(email);
-    return res.status(429).json({ error: 'too_many_attempts' });
-  }
-  const submitted = String(code).replace(/\s+/g, '').trim();
-  if (reset.code !== submitted) {
-    passwordResets.incrementAttempts(email);
-    console.log(`⚠ Yanlış kod: gözlənilən "${reset.code}", gələn "${submitted}"`);
-    return res.status(400).json({ error: 'invalid_code' });
-  }
-  res.json({ ok: true });
+  // We hide the full email — only return the masked version for a friendly UX.
+  const masked = reset.email.replace(/^(.).+(@.+)$/, (_m, first, dom) => `${first}***${dom}`);
+  res.json({ ok: true, email: masked, expiresAt: reset.expiresAt });
 });
 
-// 2b. Kod doğrula + yeni şifre ayarla
+// 3) Submit new password using the token from the URL. One-time use.
 app.post('/api/auth/reset-password', async (req, res) => {
-  const { email, code, newPassword } = req.body || {};
-  if (!email || !code || !newPassword) return res.status(400).json({ error: 'missing_fields' });
-  if (newPassword.length < 6) return res.status(400).json({ error: 'weak_password' });
+  const { token, newPassword } = req.body || {};
+  if (!token || !newPassword) return res.status(400).json({ error: 'missing_fields' });
+  if (newPassword.length < 6)  return res.status(400).json({ error: 'weak_password' });
 
-  const reset = passwordResets.find(email);
-  if (!reset) return res.status(400).json({ error: 'invalid_code' });
+  const reset = passwordResets.findByToken(token);
+  if (!reset) return res.status(404).json({ error: 'invalid_token' });
   if (new Date(reset.expiresAt) < new Date()) {
-    passwordResets.consume(email);
-    return res.status(400).json({ error: 'expired_code' });
+    passwordResets.consume(reset.token);
+    return res.status(410).json({ error: 'expired_token' });
   }
-  if (reset.attempts >= 5) {
-    passwordResets.consume(email);
-    return res.status(429).json({ error: 'too_many_attempts' });
-  }
-  const submitted2 = String(code).replace(/\s+/g, '').trim();
-  if (reset.code !== submitted2) {
-    passwordResets.incrementAttempts(email);
-    return res.status(400).json({ error: 'invalid_code' });
-  }
-
-  // Şifreyi güncelle, reset kaydını sil
   const hash = await bcrypt.hash(newPassword, 10);
   users.updatePassword(reset.userId, hash);
-  passwordResets.consume(email);
+  passwordResets.consume(reset.token);
 
   res.json({ ok: true });
 });

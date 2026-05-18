@@ -37,11 +37,15 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-export async function sendPasswordResetCode(to, name, code) {
+/** Send a one-time password-reset LINK by email. The token is embedded in the URL —
+ *  user clicks → lands on /reset-password/:token where they enter a new password.
+ *  No 6-digit codes anywhere in this flow.
+ */
+export async function sendPasswordResetLink(to, name, link) {
   const tr = await getTransporter();
 
   if (!tr) {
-    console.log(`\n🔑 [DEV] Password reset code for ${to}: ${code}\n`);
+    console.log(`\n🔑 [DEV] Password reset link for ${to}: ${link}\n`);
     return { previewUrl: null };
   }
 
@@ -50,32 +54,32 @@ export async function sendPasswordResetCode(to, name, code) {
       <div style="text-align: center; margin-bottom: 32px;">
         <div style="display: inline-block; width: 56px; height: 56px; background: linear-gradient(135deg, #4f46e5, #7c3aed); border-radius: 14px; line-height: 56px; color: white; font-size: 28px; font-weight: 800;">E</div>
       </div>
-      <h1 style="font-size: 22px; font-weight: 700; color: #0f172a; margin: 0 0 12px;">Şifrə bərpa kodu</h1>
+      <h1 style="font-size: 22px; font-weight: 700; color: #0f172a; margin: 0 0 12px;">Şifrəni bərpa edin</h1>
       <p style="font-size: 15px; line-height: 1.6; color: #475569; margin: 0 0 24px;">
         Salam <strong>${escapeHtml(name)}</strong>,<br>
-        Şifrənizi bərpa etmək üçün aşağıdakı 6 rəqəmli kodu istifadə edin:
+        Şifrənizi yeniləmək üçün aşağıdakı düyməyə basın. Link <strong>1 saat</strong> ərzində etibarlıdır və yalnız bir dəfə istifadə oluna bilər.
       </p>
-      <div style="text-align: center; margin: 32px 0;">
-        <div style="display: inline-block; font-size: 36px; font-weight: 800; letter-spacing: 12px; background: #f1f5f9; color: #4f46e5; padding: 20px 32px; border-radius: 16px; border: 2px solid #e0e7ff;">
-          ${escapeHtml(code)}
-        </div>
+      <div style="text-align: center; margin: 28px 0;">
+        <a href="${link}" style="display: inline-block; background: linear-gradient(135deg, #4f46e5, #7c3aed); color: white; text-decoration: none; padding: 14px 32px; border-radius: 12px; font-weight: 700; font-size: 15px;">
+          Şifrəni dəyiş
+        </a>
       </div>
-      <p style="font-size: 13px; color: #64748b; line-height: 1.6;">
-        Bu kod <strong>15 dəqiqə</strong> ərzində etibarlıdır. Əgər siz bu sorğunu göndərməmisinizsə, bu maili nəzərə almayın.
+      <p style="font-size: 12px; color: #94a3b8; line-height: 1.6; word-break: break-all;">
+        Düymə işləmirsə bu linki brauzerə yapışdırın:<br>${escapeHtml(link)}
       </p>
-      <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 32px 0;">
+      <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 28px 0;">
       <p style="font-size: 12px; color: #94a3b8; text-align: center; margin: 0;">
-        EduGate · Təhlükəsizliyiniz üçün bu kodu heç kimlə paylaşmayın.
+        EduGate · Bu sorğunu siz göndərməmisinizsə, bu maili nəzərə almayın və şifrəniz dəyişməyəcək.
       </p>
     </div>
   `;
 
   const info = await tr.sendMail({
     from: process.env.MAIL_FROM || '"EduGate" <noreply@edugate.local>',
-    to, subject: 'EduGate — Şifrə bərpa kodu', html,
+    to, subject: 'EduGate — Şifrə bərpa linki', html,
   });
 
-  console.log(`📧 Reset kodu göndərildi → ${to} · kod: ${code}`);
+  console.log(`📧 Reset linki göndərildi → ${to}`);
   const previewUrl = usingEthereal ? nodemailer.getTestMessageUrl(info) : null;
   if (previewUrl) console.log(`   Preview: ${previewUrl}`);
   return { previewUrl };
@@ -181,9 +185,4 @@ export async function sendSms(to, body) {
 /** Registration OTP: short body, just the code + a nudge not to share it. */
 export async function sendSmsOtp(phone, code) {
   return sendSms(phone, `EduGate: təsdiq kodunuz ${code}. Heç kimlə paylaşmayın.`);
-}
-
-/** Password reset OTP variant — wording differs slightly for clarity. */
-export async function sendPasswordResetSms(phone, code) {
-  return sendSms(phone, `EduGate: şifrə bərpa kodunuz ${code}. 15 dəqiqə etibarlıdır.`);
 }
