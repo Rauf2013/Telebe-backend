@@ -80,3 +80,60 @@ export async function sendPasswordResetCode(to, name, code) {
   if (previewUrl) console.log(`   Preview: ${previewUrl}`);
   return { previewUrl };
 }
+
+/* ---------- University rep invite (email with secret signup link) ---------- */
+export async function sendUniInviteLink(to, name, link, universityName) {
+  const tr = await getTransporter();
+  if (!tr) {
+    console.log(`\n🎓 [DEV] University rep invite for ${to} (${universityName || '—'}): ${link}\n`);
+    return { previewUrl: null };
+  }
+
+  const html = `
+    <div style="font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 32px 24px; color: #1e293b;">
+      <div style="text-align: center; margin-bottom: 32px;">
+        <div style="display: inline-block; width: 56px; height: 56px; background: linear-gradient(135deg, #4f46e5, #7c3aed); border-radius: 14px; line-height: 56px; color: white; font-size: 28px; font-weight: 800;">E</div>
+      </div>
+      <h1 style="font-size: 22px; font-weight: 700; color: #0f172a; margin: 0 0 12px;">Universitet təmsilçisi dəvəti</h1>
+      <p style="font-size: 15px; line-height: 1.6; color: #475569; margin: 0 0 20px;">
+        Salam${name ? ' <strong>' + escapeHtml(name) + '</strong>' : ''},<br>
+        EduGate platforması üzərindən ${universityName ? '<strong>' + escapeHtml(universityName) + '</strong>' : 'bir universitet'} təmsilçisi kimi qeydiyyatdan keçmək üçün sizə xüsusi link göndərilir. Bu link <strong>yalnız bir dəfə</strong> istifadə oluna bilər.
+      </p>
+      <div style="text-align: center; margin: 28px 0;">
+        <a href="${link}" style="display: inline-block; background: linear-gradient(135deg, #4f46e5, #7c3aed); color: white; text-decoration: none; padding: 14px 28px; border-radius: 12px; font-weight: 700; font-size: 15px;">
+          Qeydiyyatı tamamla
+        </a>
+      </div>
+      <p style="font-size: 12px; color: #94a3b8; line-height: 1.6; word-break: break-all;">
+        Link işləmirsə brauzerə yapışdırın:<br>${escapeHtml(link)}
+      </p>
+      <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 28px 0;">
+      <p style="font-size: 12px; color: #94a3b8; text-align: center; margin: 0;">
+        EduGate · Linkin müddəti 7 gündür. Bu maili gözləmirdinizsə nəzərə almayın.
+      </p>
+    </div>
+  `;
+
+  const info = await tr.sendMail({
+    from: process.env.MAIL_FROM || '"EduGate" <noreply@edugate.local>',
+    to, subject: 'EduGate — Universitet təmsilçisi dəvəti', html,
+  });
+
+  console.log(`📧 Universitet dəvəti göndərildi → ${to}`);
+  const previewUrl = usingEthereal ? nodemailer.getTestMessageUrl(info) : null;
+  if (previewUrl) console.log(`   Preview: ${previewUrl}`);
+  return { previewUrl };
+}
+
+/* ---------- SMS OTP (DEV: console only; production should plug an SMS API here) ---------- */
+export async function sendSmsOtp(phone, code) {
+  // In production wire Twilio / AWS SNS / etc. here using env credentials.
+  // For dev we always log the code so QA can complete signup without a real SMS gateway.
+  if (process.env.SMS_PROVIDER) {
+    console.log(`📱 [SMS via ${process.env.SMS_PROVIDER}] → ${phone} · ${code}`);
+    // No real send implemented here — placeholder hook for prod integration.
+  } else {
+    console.log(`\n📱 [DEV SMS] OTP code for ${phone}: ${code}\n`);
+  }
+  return { ok: true };
+}

@@ -22,18 +22,34 @@ db.exec(`
     role            TEXT NOT NULL CHECK(role IN ('student','university','moderator')),
     phone           TEXT,
     whatsapp        TEXT,
+    country         TEXT,
+    city            TEXT,
     university_id   TEXT,
     email_verified  INTEGER NOT NULL DEFAULT 0,
+    phone_verified  INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS moderator_invites (
-    token       TEXT PRIMARY KEY,
-    created_by  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    note        TEXT,
+    token         TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL DEFAULT 'moderator',
+    created_by    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    note          TEXT,
+    target_email  TEXT,
+    target_name   TEXT,
+    university_id TEXT,
+    expires_at    TEXT NOT NULL,
+    used_at       TEXT,
+    used_by       TEXT,
+    created_at    TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS phone_verifications (
+    phone       TEXT PRIMARY KEY,
+    code        TEXT NOT NULL,
+    payload     TEXT NOT NULL,             -- JSON: pending registration data (full_name, email, hashed_password, ...)
+    attempts    INTEGER NOT NULL DEFAULT 0,
     expires_at  TEXT NOT NULL,
-    used_at     TEXT,
-    used_by     TEXT,
     created_at  TEXT NOT NULL
   );
 
@@ -87,10 +103,22 @@ db.exec(`
 // Migration: email_verifications tablosu varsa düş (artık kullanılmıyor)
 db.exec(`DROP TABLE IF EXISTS email_verifications`);
 // Mevcut kullanıcıları onaylı yap (artık email doğrulama yok)
-const cols = db.prepare(`PRAGMA table_info(users)`).all();
-if (cols.some(c => c.name === 'email_verified')) {
+const userCols = db.prepare(`PRAGMA table_info(users)`).all();
+if (userCols.some(c => c.name === 'email_verified')) {
   db.exec(`UPDATE users SET email_verified = 1 WHERE email_verified = 0`);
 }
+// Add country/city/phone_verified columns for existing DBs
+function ensureColumn(table, name, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some(c => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+}
+ensureColumn('users', 'country', `country TEXT`);
+ensureColumn('users', 'city',    `city TEXT`);
+ensureColumn('users', 'phone_verified', `phone_verified INTEGER NOT NULL DEFAULT 0`);
+ensureColumn('moderator_invites', 'kind',          `kind TEXT NOT NULL DEFAULT 'moderator'`);
+ensureColumn('moderator_invites', 'target_email',  `target_email TEXT`);
+ensureColumn('moderator_invites', 'target_name',   `target_name TEXT`);
+ensureColumn('moderator_invites', 'university_id', `university_id TEXT`);
 
 /* ---------- row <-> object mappers ---------- */
 function rowToUser(r) {
@@ -98,8 +126,10 @@ function rowToUser(r) {
   return {
     id: r.id, email: r.email, password: r.password, fullName: r.full_name,
     role: r.role, phone: r.phone || undefined, whatsapp: r.whatsapp || undefined,
+    country: r.country || undefined, city: r.city || undefined,
     universityId: r.university_id || undefined,
     emailVerified: !!r.email_verified,
+    phoneVerified: !!r.phone_verified,
     createdAt: r.created_at,
   };
 }
@@ -128,18 +158,27 @@ export const users = {
   },
   create(u) {
     db.prepare(`
-      INSERT INTO users (id,email,password,full_name,role,phone,whatsapp,university_id,created_at)
-      VALUES (@id,@email,@password,@fullName,@role,@phone,@whatsapp,@universityId,@createdAt)
+      INSERT INTO users (id,email,password,full_name,role,phone,whatsapp,country,city,university_id,created_at)
+      VALUES (@id,@email,@password,@fullName,@role,@phone,@whatsapp,@country,@city,@universityId,@createdAt)
     `).run({
       id: u.id, email: u.email, password: u.password, fullName: u.fullName,
       role: u.role, phone: u.phone ?? null, whatsapp: u.whatsapp ?? null,
+      country: u.country ?? null, city: u.city ?? null,
       universityId: u.universityId ?? null, createdAt: u.createdAt,
     });
     return this.findById(u.id);
   },
-  updateProfile(id, { fullName, phone, whatsapp }) {
-    db.prepare(`UPDATE users SET full_name = ?, phone = ?, whatsapp = ? WHERE id = ?`)
-      .run(fullName, phone ?? null, whatsapp ?? null, id);
+  updateProfile(id, { fullName, phone, whatsapp, country, city }) {
+    const cur = this.findById(id);
+    db.prepare(`UPDATE users SET full_name = ?, phone = ?, whatsapp = ?, country = ?, city = ? WHERE id = ?`)
+      .run(
+        fullName,
+        phone ?? null,
+        whatsapp ?? null,
+        country ?? cur?.country ?? null,
+        city ?? cur?.city ?? null,
+        id,
+      );
     return this.findById(id);
   },
   updatePassword(id, hash) {
@@ -147,6 +186,9 @@ export const users = {
   },
   markEmailVerified(id) {
     db.prepare(`UPDATE users SET email_verified = 1 WHERE id = ?`).run(id);
+  },
+  markPhoneVerified(id) {
+    db.prepare(`UPDATE users SET phone_verified = 1 WHERE id = ?`).run(id);
   },
 };
 
@@ -158,39 +200,87 @@ function makeToken() {
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
+function rowToInvite(r) {
+  if (!r) return null;
+  return {
+    token: r.token,
+    kind: r.kind || 'moderator',
+    createdBy: r.created_by,
+    note: r.note || undefined,
+    targetEmail: r.target_email || undefined,
+    targetName: r.target_name || undefined,
+    universityId: r.university_id || undefined,
+    expiresAt: r.expires_at,
+    usedAt: r.used_at || undefined,
+    usedBy: r.used_by || undefined,
+    createdAt: r.created_at,
+  };
+}
+
 export const invites = {
-  create({ createdBy, note, ttlDays = 7 }) {
+  create({ createdBy, note, kind = 'moderator', targetEmail, targetName, universityId, ttlDays = 7 }) {
     const token = makeToken();
     const now = new Date();
     const expires = new Date(now.getTime() + ttlDays * 24 * 60 * 60 * 1000);
     db.prepare(`
-      INSERT INTO moderator_invites (token, created_by, note, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(token, createdBy, note ?? null, expires.toISOString(), now.toISOString());
-    return { token, expiresAt: expires.toISOString() };
+      INSERT INTO moderator_invites
+        (token, kind, created_by, note, target_email, target_name, university_id, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      token, kind, createdBy, note ?? null,
+      targetEmail ?? null, targetName ?? null, universityId ?? null,
+      expires.toISOString(), now.toISOString(),
+    );
+    return { token, kind, expiresAt: expires.toISOString() };
   },
   find(token) {
-    const r = db.prepare(`SELECT * FROM moderator_invites WHERE token = ?`).get(token);
-    if (!r) return null;
-    return {
-      token: r.token, createdBy: r.created_by, note: r.note || undefined,
-      expiresAt: r.expires_at, usedAt: r.used_at || undefined,
-      usedBy: r.used_by || undefined, createdAt: r.created_at,
-    };
+    return rowToInvite(db.prepare(`SELECT * FROM moderator_invites WHERE token = ?`).get(token));
   },
   consume(token, newUserId) {
     db.prepare(`UPDATE moderator_invites SET used_at = ?, used_by = ? WHERE token = ?`)
       .run(new Date().toISOString(), newUserId, token);
   },
-  listAll() {
-    return db.prepare(`SELECT * FROM moderator_invites ORDER BY created_at DESC`).all().map(r => ({
-      token: r.token, createdBy: r.created_by, note: r.note || undefined,
-      expiresAt: r.expires_at, usedAt: r.used_at || undefined,
-      usedBy: r.used_by || undefined, createdAt: r.created_at,
-    }));
+  listAll(kind) {
+    const sql = kind
+      ? `SELECT * FROM moderator_invites WHERE kind = ? ORDER BY created_at DESC`
+      : `SELECT * FROM moderator_invites ORDER BY created_at DESC`;
+    return (kind ? db.prepare(sql).all(kind) : db.prepare(sql).all()).map(rowToInvite);
   },
   delete(token) {
     db.prepare(`DELETE FROM moderator_invites WHERE token = ?`).run(token);
+  },
+};
+
+/* ---------- PHONE VERIFICATIONS (SMS OTP for student registration) ---------- */
+export const phoneVerifications = {
+  upsert({ phone, code, payload, ttlMin = 15 }) {
+    const now = new Date();
+    const expires = new Date(now.getTime() + ttlMin * 60 * 1000);
+    db.prepare(`
+      INSERT INTO phone_verifications (phone, code, payload, attempts, expires_at, created_at)
+      VALUES (?, ?, ?, 0, ?, ?)
+      ON CONFLICT(phone) DO UPDATE SET
+        code = excluded.code,
+        payload = excluded.payload,
+        attempts = 0,
+        expires_at = excluded.expires_at,
+        created_at = excluded.created_at
+    `).run(phone, code, JSON.stringify(payload), expires.toISOString(), now.toISOString());
+    return { expiresAt: expires.toISOString() };
+  },
+  find(phone) {
+    const r = db.prepare(`SELECT * FROM phone_verifications WHERE phone = ?`).get(phone);
+    if (!r) return null;
+    return {
+      phone: r.phone, code: r.code, payload: JSON.parse(r.payload),
+      attempts: r.attempts, expiresAt: r.expires_at, createdAt: r.created_at,
+    };
+  },
+  incrementAttempts(phone) {
+    db.prepare(`UPDATE phone_verifications SET attempts = attempts + 1 WHERE phone = ?`).run(phone);
+  },
+  consume(phone) {
+    db.prepare(`DELETE FROM phone_verifications WHERE phone = ?`).run(phone);
   },
 };
 

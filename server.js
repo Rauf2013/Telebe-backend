@@ -7,8 +7,8 @@ import multer from 'multer';
 import { randomUUID } from 'crypto';
 import { join, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
-import { users, applications, notifications, invites, events, passwordResets, stats } from './db.js';
-import { sendPasswordResetCode } from './mailer.js';
+import { users, applications, notifications, invites, events, passwordResets, phoneVerifications, stats } from './db.js';
+import { sendPasswordResetCode, sendUniInviteLink, sendSmsOtp } from './mailer.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -54,22 +54,98 @@ function authRequired(roles = []) {
 }
 
 /* ---------- AUTH ---------- */
+// Step 1: Student fills the form → backend stores pending registration + sends SMS OTP.
+//         Existing email + already-pending-phone collisions are caught here.
+//         University-rep accounts are NOT created here — they come via /invites/:token/accept.
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, fullName, role, phone, whatsapp, universityId } = req.body || {};
-  if (!email || !password || !fullName || !role) return res.status(400).json({ error: 'missing_fields' });
-  if (role !== 'student' && role !== 'university') return res.status(403).json({ error: 'forbidden_role' });
-  if (users.findByEmail(email)) return res.status(409).json({ error: 'email_exists' });
+  const { email, password, fullName, phone, whatsapp, country, city } = req.body || {};
+  if (!email || !password || !fullName || !phone || !country || !city) {
+    return res.status(400).json({ error: 'missing_fields' });
+  }
   if (password.length < 6) return res.status(400).json({ error: 'weak_password' });
+  if (users.findByEmail(email)) return res.status(409).json({ error: 'email_exists' });
 
   const hash = await bcrypt.hash(password, 10);
-  let user = users.create({
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+
+  phoneVerifications.upsert({
+    phone,
+    code,
+    payload: {
+      email: String(email).toLowerCase().trim(),
+      fullName: String(fullName).trim(),
+      password: hash,
+      role: 'student',
+      phone,
+      whatsapp: whatsapp || null,
+      country,
+      city,
+    },
+  });
+  try { await sendSmsOtp(phone, code); } catch (e) { console.error('SMS send failed:', e.message); }
+
+  // We never echo the code in the response. In dev it's printed to the server console.
+  res.json({ ok: true, requiresOtp: true, phone });
+});
+
+// Step 2: Student enters the 6-digit code → we verify, materialize the user, return a token.
+app.post('/api/auth/verify-otp', async (req, res) => {
+  const { phone, code } = req.body || {};
+  if (!phone || !code) return res.status(400).json({ error: 'missing_fields' });
+
+  const v = phoneVerifications.find(phone);
+  if (!v) return res.status(400).json({ error: 'invalid_code' });
+  if (new Date(v.expiresAt) < new Date()) {
+    phoneVerifications.consume(phone);
+    return res.status(400).json({ error: 'expired_code' });
+  }
+  if (v.attempts >= 5) {
+    phoneVerifications.consume(phone);
+    return res.status(429).json({ error: 'too_many_attempts' });
+  }
+  const submitted = String(code).replace(/\s+/g, '').trim();
+  if (v.code !== submitted) {
+    phoneVerifications.incrementAttempts(phone);
+    return res.status(400).json({ error: 'invalid_code' });
+  }
+
+  // Race-safety: email might have been claimed between step 1 and step 2.
+  if (users.findByEmail(v.payload.email)) {
+    phoneVerifications.consume(phone);
+    return res.status(409).json({ error: 'email_exists' });
+  }
+
+  const created = users.create({
     id: randomUUID(),
-    email, password: hash, fullName, role, phone, whatsapp, universityId,
+    email: v.payload.email,
+    password: v.payload.password,
+    fullName: v.payload.fullName,
+    role: 'student',
+    phone: v.payload.phone,
+    whatsapp: v.payload.whatsapp ?? null,
+    country: v.payload.country,
+    city: v.payload.city,
     createdAt: new Date().toISOString(),
   });
-  users.markEmailVerified(user.id);
-  user = users.findById(user.id);
+  users.markPhoneVerified(created.id);
+  // Re-read so the response (and the JWT) reflect the verified flag.
+  const user = users.findById(created.id);
+  // Email verification will happen separately later if/when we add an email step for students;
+  // for now we leave it false so a future flow can flip it.
+  phoneVerifications.consume(phone);
   res.json({ user: publicUser(user), token: sign(user) });
+});
+
+// Optional: re-send OTP if the user lost the SMS.
+app.post('/api/auth/resend-otp', async (req, res) => {
+  const { phone } = req.body || {};
+  if (!phone) return res.status(400).json({ error: 'missing_fields' });
+  const v = phoneVerifications.find(phone);
+  if (!v) return res.status(404).json({ error: 'no_pending_registration' });
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  phoneVerifications.upsert({ phone, code, payload: v.payload });
+  try { await sendSmsOtp(phone, code); } catch (e) { console.error('SMS send failed:', e.message); }
+  res.json({ ok: true });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -165,9 +241,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 app.patch('/api/auth/me', authRequired(), (req, res) => {
-  const { fullName, phone, whatsapp } = req.body || {};
+  const { fullName, phone, whatsapp, country, city } = req.body || {};
   if (!fullName) return res.status(400).json({ error: 'missing_fields' });
-  const user = users.updateProfile(req.user.id, { fullName, phone, whatsapp });
+  const user = users.updateProfile(req.user.id, { fullName, phone, whatsapp, country, city });
   res.json({ user: publicUser(user), token: sign(user) });
 });
 
@@ -246,37 +322,74 @@ app.post('/api/admin/moderators', authRequired(['moderator']), async (req, res) 
   res.json({ moderator: publicUser(users.findById(user.id)) });
 });
 
-/* ---------- MODERATOR INVITE SYSTEM ---------- */
-// Moderator davet linki oluştur
+/* ---------- INVITE SYSTEM (moderator + university representative) ---------- */
+// Create moderator invite (legacy endpoint, unchanged behavior — still kind=moderator).
 app.post('/api/admin/invites', authRequired(['moderator']), (req, res) => {
   const { note } = req.body || {};
-  const inv = invites.create({ createdBy: req.user.id, note });
+  const inv = invites.create({ createdBy: req.user.id, note, kind: 'moderator' });
   res.json({ invite: inv });
 });
 
-// Mevcut davetleri listele
-app.get('/api/admin/invites', authRequired(['moderator']), (_req, res) => {
-  res.json({ invites: invites.listAll() });
+// Create university-rep invite. Moderator picks the university + target email + name;
+// we generate a one-time link and email it to the target.
+app.post('/api/admin/uni-invites', authRequired(['moderator']), async (req, res) => {
+  // universityName is purely cosmetic (used in the email body); the moderator UI sends it
+  // because the backend has no copy of the universities catalog.
+  const { targetEmail, targetName, universityId, universityName, note } = req.body || {};
+  if (!targetEmail || !universityId) return res.status(400).json({ error: 'missing_fields' });
+
+  const inv = invites.create({
+    createdBy: req.user.id,
+    kind: 'university',
+    note,
+    targetEmail: String(targetEmail).toLowerCase().trim(),
+    targetName: targetName ?? null,
+    universityId,
+  });
+
+  // Build the absolute link the user will click in the email. APP_URL takes priority for
+  // any non-default frontend host (prod, staging, tunneled dev).
+  const origin = process.env.APP_URL || `${req.protocol}://${req.get('host').replace(/:\d+$/, ':5173')}`;
+  const link = `${origin.replace(/\/$/, '')}/invite/${inv.token}`;
+
+  try { await sendUniInviteLink(targetEmail, targetName, link, universityName || universityId); }
+  catch (e) { console.error('Uni invite mail failed:', e.message); }
+
+  res.json({ invite: { ...inv, link } });
 });
 
-// Daveti sil/iptal et
+// Combined list (both moderator + university invites). UI filters per panel.
+app.get('/api/admin/invites', authRequired(['moderator']), (req, res) => {
+  const kind = req.query.kind;
+  res.json({ invites: invites.listAll(kind) });
+});
+
+// Cancel/delete a moderator OR university invite (same endpoint, identified by token).
 app.delete('/api/admin/invites/:token', authRequired(['moderator']), (req, res) => {
   invites.delete(req.params.token);
   res.json({ ok: true });
 });
 
-// Public: davet token doğrulama (UI için)
+// Public: validate an invite token (used by /invite/:token page to decide what form to show).
 app.get('/api/invites/:token', (req, res) => {
   const inv = invites.find(req.params.token);
   if (!inv) return res.status(404).json({ error: 'invalid_token' });
   if (inv.usedAt) return res.status(410).json({ error: 'already_used' });
   if (new Date(inv.expiresAt) < new Date()) return res.status(410).json({ error: 'expired' });
-  res.json({ ok: true, expiresAt: inv.expiresAt, note: inv.note });
+  res.json({
+    ok: true,
+    kind: inv.kind,
+    expiresAt: inv.expiresAt,
+    note: inv.note,
+    targetEmail: inv.targetEmail,
+    targetName: inv.targetName,
+    universityId: inv.universityId,
+  });
 });
 
-// Public: daveti kabul et — moderator hesabı yarat
+// Public: accept an invite — creates either a moderator OR a university-rep account.
 app.post('/api/invites/:token/accept', async (req, res) => {
-  const { email, password, fullName, phone } = req.body || {};
+  const { email, password, fullName, phone, whatsapp } = req.body || {};
   if (!email || !password || !fullName) return res.status(400).json({ error: 'missing_fields' });
   if (password.length < 6) return res.status(400).json({ error: 'weak_password' });
 
@@ -286,15 +399,22 @@ app.post('/api/invites/:token/accept', async (req, res) => {
   if (new Date(inv.expiresAt) < new Date()) return res.status(410).json({ error: 'expired' });
   if (users.findByEmail(email)) return res.status(409).json({ error: 'email_exists' });
 
+  const role = inv.kind === 'university' ? 'university' : 'moderator';
+  // For uni invites the moderator has already chosen the target university — we trust the invite, not the body.
+  const universityId = role === 'university' ? inv.universityId : null;
+  if (role === 'university' && !universityId) return res.status(400).json({ error: 'missing_university' });
+
   const hash = await bcrypt.hash(password, 10);
-  const user = users.create({
+  const created = users.create({
     id: randomUUID(),
-    email, password: hash, fullName, role: 'moderator', phone,
+    email, password: hash, fullName, role, phone, whatsapp: whatsapp ?? null,
+    universityId,
     createdAt: new Date().toISOString(),
   });
-  users.markEmailVerified(user.id);
-  invites.consume(req.params.token, user.id);
-  res.json({ user: publicUser(user), token: sign(user) });
+  users.markEmailVerified(created.id);
+  invites.consume(req.params.token, created.id);
+  const user = users.findById(created.id);
+  res.json({ user: publicUser(user), token: sign(user), role });
 });
 
 /* ---------- APPLICATIONS — STUDENT ---------- */
