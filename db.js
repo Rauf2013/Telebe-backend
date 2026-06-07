@@ -55,10 +55,13 @@ async function initSchema() {
       country         TEXT,
       city            TEXT,
       university_id   TEXT,
+      student_code    TEXT UNIQUE,
       email_verified  BOOLEAN NOT NULL DEFAULT FALSE,
       phone_verified  BOOLEAN NOT NULL DEFAULT FALSE,
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    -- legacy DBs may miss student_code; add it idempotently
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS student_code TEXT UNIQUE;
 
     CREATE TABLE IF NOT EXISTS moderator_invites (
       token         TEXT PRIMARY KEY,
@@ -124,10 +127,34 @@ async function initSchema() {
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS messages (
+      id              TEXT PRIMARY KEY,
+      application_id  TEXT NOT NULL,
+      sender_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      recipient_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      content         TEXT NOT NULL,
+      read_at         TIMESTAMPTZ,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS reapply_requests (
+      id              TEXT PRIMARY KEY,
+      application_id  TEXT NOT NULL,
+      student_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reason          TEXT,
+      same_language   BOOLEAN NOT NULL DEFAULT TRUE,
+      handled_at      TIMESTAMPTZ,
+      handled_by      TEXT,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_users_email     ON users(LOWER(email));
     CREATE INDEX IF NOT EXISTS idx_apps_student_id ON applications(student_id);
     CREATE INDEX IF NOT EXISTS idx_notif_user_id   ON notifications(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_events_app_id   ON app_events(application_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_msg_app_id      ON messages(application_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_msg_recipient   ON messages(recipient_id, read_at);
+    CREATE INDEX IF NOT EXISTS idx_reapply_student ON reapply_requests(student_id, created_at DESC);
   `);
 }
 
@@ -147,6 +174,7 @@ function rowToUser(r) {
     role: r.role, phone: r.phone || undefined, whatsapp: r.whatsapp || undefined,
     country: r.country || undefined, city: r.city || undefined,
     universityId: r.university_id || undefined,
+    studentCode: r.student_code || undefined,
     emailVerified: !!r.email_verified,
     phoneVerified: !!r.phone_verified,
     createdAt: toIso(r.created_at),
@@ -251,6 +279,37 @@ export const users = {
   },
   async markPhoneVerified(id) {
     await pool.query(`UPDATE users SET phone_verified = TRUE WHERE id = $1`, [id]);
+  },
+  /**
+   * Generates the next student code for a given country on a given date.
+   * Format: AAA999-DDMMYY   (e.g. AZ012-300526 = 12th AZ applicant on 30 May 2026)
+   * Two-letter country code + zero-padded daily sequence + DDMMYY.
+   * Sequence resets each calendar day per country.
+   */
+  async nextStudentCode(countryCode, dateIso = new Date().toISOString()) {
+    const cc = String(countryCode || 'XX').toUpperCase().slice(0, 2);
+    const d  = new Date(dateIso);
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const yy = String(d.getUTCFullYear()).slice(-2);
+    const datePart = `${dd}${mm}${yy}`;
+    const prefix = `${cc}`;
+    const suffix = `-${datePart}`;
+    const r = await pool.query(
+      `SELECT student_code FROM users
+       WHERE student_code LIKE $1 AND student_code LIKE $2
+       ORDER BY student_code DESC LIMIT 1`,
+      [`${prefix}%`, `%${suffix}`],
+    );
+    let seq = 1;
+    if (r.rows[0]) {
+      const m = String(r.rows[0].student_code).match(/^([A-Z]{2})(\d{3})-(\d{6})$/);
+      if (m) seq = Number(m[2]) + 1;
+    }
+    return `${prefix}${String(seq).padStart(3, '0')}${suffix}`;
+  },
+  async setStudentCode(id, code) {
+    await pool.query(`UPDATE users SET student_code = $1 WHERE id = $2`, [code, id]);
   },
 };
 
@@ -468,6 +527,88 @@ export const phoneVerifications = {
     await pool.query(`DELETE FROM phone_verifications WHERE phone = $1`, [phone]);
   },
 };
+
+/* ---------- MESSAGES (student ↔ university chat) ---------- */
+export const messages = {
+  async create({ applicationId, senderId, recipientId, content }) {
+    const id = makeToken();
+    await pool.query(
+      `INSERT INTO messages (id, application_id, sender_id, recipient_id, content)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [id, applicationId, senderId, recipientId, content],
+    );
+    const r = await pool.query(`SELECT * FROM messages WHERE id = $1`, [id]);
+    return rowToMessage(r.rows[0]);
+  },
+  async listByApp(applicationId) {
+    const r = await pool.query(
+      `SELECT * FROM messages WHERE application_id = $1 ORDER BY created_at ASC`,
+      [applicationId],
+    );
+    return r.rows.map(rowToMessage);
+  },
+  async markRead(applicationId, recipientId) {
+    await pool.query(
+      `UPDATE messages SET read_at = NOW()
+       WHERE application_id = $1 AND recipient_id = $2 AND read_at IS NULL`,
+      [applicationId, recipientId],
+    );
+  },
+  async unreadCount(userId) {
+    const r = await pool.query(
+      `SELECT COUNT(*) AS c FROM messages WHERE recipient_id = $1 AND read_at IS NULL`,
+      [userId],
+    );
+    return Number(r.rows[0].c);
+  },
+};
+
+function rowToMessage(r) {
+  if (!r) return null;
+  return {
+    id: r.id, applicationId: r.application_id,
+    senderId: r.sender_id, recipientId: r.recipient_id,
+    content: r.content,
+    readAt: r.read_at ? toIso(r.read_at) : undefined,
+    createdAt: toIso(r.created_at),
+  };
+}
+
+/* ---------- REAPPLY REQUESTS ---------- */
+export const reapplyRequests = {
+  async create({ applicationId, studentId, reason, sameLanguage }) {
+    const id = makeToken();
+    await pool.query(
+      `INSERT INTO reapply_requests (id, application_id, student_id, reason, same_language)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [id, applicationId, studentId, reason || null, !!sameLanguage],
+    );
+    return { id, applicationId, studentId, reason, sameLanguage };
+  },
+  async listPending() {
+    const r = await pool.query(
+      `SELECT * FROM reapply_requests WHERE handled_at IS NULL ORDER BY created_at DESC`,
+    );
+    return r.rows.map(rowToReapply);
+  },
+  async handle(id, moderatorId) {
+    await pool.query(
+      `UPDATE reapply_requests SET handled_at = NOW(), handled_by = $1 WHERE id = $2`,
+      [moderatorId, id],
+    );
+  },
+};
+
+function rowToReapply(r) {
+  if (!r) return null;
+  return {
+    id: r.id, applicationId: r.application_id, studentId: r.student_id,
+    reason: r.reason || undefined, sameLanguage: !!r.same_language,
+    handledAt: r.handled_at ? toIso(r.handled_at) : undefined,
+    handledBy: r.handled_by || undefined,
+    createdAt: toIso(r.created_at),
+  };
+}
 
 /* ---------- STATS ---------- */
 export async function stats() {

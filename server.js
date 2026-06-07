@@ -9,7 +9,8 @@ import { join, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
 import {
   users, applications, notifications, invites, events,
-  passwordResets, phoneVerifications, stats, ready as dbReady,
+  passwordResets, phoneVerifications, messages, reapplyRequests,
+  stats, ready as dbReady,
 } from './db.js';
 import { sendPasswordResetLink, sendUniInviteLink, sendSmsOtp } from './mailer.js';
 
@@ -128,6 +129,15 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     createdAt: new Date().toISOString(),
   });
   await users.markPhoneVerified(created.id);
+
+  // Generate per-spec unique student code (e.g. AZ012-300526) and persist it.
+  try {
+    const code = await users.nextStudentCode(v.payload.country);
+    await users.setStudentCode(created.id, code);
+  } catch (e) {
+    console.error('student code generation failed:', e.message);
+  }
+
   const user = await users.findById(created.id);
   await phoneVerifications.consume(phone);
   res.json({ user: publicUser(user), token: sign(user) });
@@ -580,6 +590,132 @@ app.get('/api/applications/:id/events', authRequired(), async (req, res) => {
   }
   const list = await events.listByApp(req.params.id);
   res.json({ events: list });
+});
+
+/* ---------- MESSAGES (student ↔ university chat) ----------
+   Per spec: chat is unlocked after the student's choice is approved by the
+   university AND the second payment is paid (the "Müsbət cavab + ödənişdən
+   sonra portal üzərindən universitetin təmsilçisi ilə yazışma" step).
+   Both parties can read & write history for the application. Moderators are
+   read-only for oversight.
+---------------------------------------------------------- */
+function canChatOnApp(app, user) {
+  if (!app) return false;
+  if (user.role === 'moderator') return true; // read-only audit
+  const hasApproved = app.choices.some(c => c.status === 'approved');
+  if (!hasApproved || !app.secondPaymentPaid) return false;
+  if (user.role === 'student')    return app.studentId === user.id;
+  if (user.role === 'university') return app.choices.some(c =>
+    c.universityId === user.universityId && c.status === 'approved');
+  return false;
+}
+
+app.get('/api/applications/:id/messages', authRequired(), async (req, res) => {
+  const app = await applications.findById(req.params.id);
+  if (!app) return res.status(404).json({ error: 'not_found' });
+  if (!canChatOnApp(app, req.user)) return res.status(403).json({ error: 'chat_locked' });
+  const list = await messages.listByApp(req.params.id);
+  await messages.markRead(req.params.id, req.user.id).catch(() => {});
+  res.json({ messages: list });
+});
+
+app.post('/api/applications/:id/messages', authRequired(['student', 'university']), async (req, res) => {
+  const { content } = req.body || {};
+  if (!content || !String(content).trim()) return res.status(400).json({ error: 'empty_message' });
+
+  const app = await applications.findById(req.params.id);
+  if (!app) return res.status(404).json({ error: 'not_found' });
+  if (req.user.role === 'moderator') return res.status(403).json({ error: 'moderator_read_only' });
+  if (!canChatOnApp(app, req.user)) return res.status(403).json({ error: 'chat_locked' });
+
+  // Determine recipient: student -> the approved university rep; uni rep -> student.
+  let recipientId;
+  if (req.user.role === 'student') {
+    const approved = app.choices.find(c => c.status === 'approved');
+    if (!approved) return res.status(400).json({ error: 'no_approved_choice' });
+    const allUsers = await users.list();
+    const rep = allUsers.find(u => u.role === 'university' && u.universityId === approved.universityId);
+    if (!rep) return res.status(400).json({ error: 'no_university_rep' });
+    recipientId = rep.id;
+  } else {
+    recipientId = app.studentId;
+  }
+
+  const msg = await messages.create({
+    applicationId: req.params.id,
+    senderId: req.user.id,
+    recipientId,
+    content: String(content).trim().slice(0, 4000),
+  });
+
+  notify(recipientId, 'message', 'Yeni mesaj',
+    `${req.user.fullName ?? 'İstifadəçi'} sizə mesaj göndərdi.`,
+    req.user.role === 'student' ? '/university' : '/student');
+
+  res.json({ message: msg });
+});
+
+/* ---------- RE-APPLY (student requests resending docs to other unis) ----------
+   Per spec:
+   - same-language: moderator sends docs to other same-language uni faculties
+     without any new translation payment ("ödənişsiz davam edir").
+   - country/language change: a new translation payment is required
+     (firstPaymentPaid is reset to false; status drops back to documents_uploaded).
+---------------------------------------------------------- */
+app.post('/api/applications/:id/reapply', authRequired(['student']), async (req, res) => {
+  const { reason, sameLanguage = true } = req.body || {};
+  const app = await applications.findById(req.params.id);
+  if (!app) return res.status(404).json({ error: 'not_found' });
+  if (app.studentId !== req.user.id) return res.status(403).json({ error: 'forbidden' });
+
+  const sameLang = !!sameLanguage;
+
+  if (!sameLang) {
+    app.firstPaymentPaid = false;
+    app.status = 'first_payment_pending';
+  } else {
+    app.status = 'sent_to_university';
+  }
+  // Reset choice statuses that were finalized — they need to be re-evaluated.
+  app.choices = app.choices.map(c =>
+    c.status === 'rejected' || c.status === 'approved'
+      ? { ...c, status: sameLang ? 'sent_to_university' : 'in_translation' }
+      : c,
+  );
+  const saved = await applications.save(app);
+
+  await reapplyRequests.create({
+    applicationId: app.id,
+    studentId: req.user.id,
+    reason,
+    sameLanguage: sameLang,
+  });
+
+  logEvent(app.id, req.user, sameLang ? 'reapply_same_lang' : 'reapply_country_change',
+    sameLang
+      ? `Tələbə yenidən müraciət istədi (eyni dil — ödənişsiz)`
+      : `Tələbə ölkəni dəyişdi — yeni tərcümə ödənişi tələb olunur`);
+
+  const allUsers = await users.list();
+  const me = await users.findById(req.user.id);
+  allUsers.filter(u => u.role === 'moderator').forEach(m =>
+    notify(m.id, 'reapply',
+      sameLang ? 'Yenidən müraciət (eyni dil)' : 'Yenidən müraciət (ölkə dəyişdi)',
+      `${me?.fullName ?? 'Tələbə'} yenidən müraciət istəyir. ${reason ? `Səbəb: ${reason}` : ''}`,
+      '/moderator'),
+  );
+
+  res.json({ application: saved, requiresNewPayment: !sameLang });
+});
+
+app.get('/api/moderator/reapplies', authRequired(['moderator']), async (_req, res) => {
+  const list = await reapplyRequests.listPending();
+  res.json({ requests: list });
+});
+
+app.post('/api/moderator/reapplies/:id/handle', authRequired(['moderator']), async (req, res) => {
+  await reapplyRequests.handle(req.params.id, req.user.id);
+  res.json({ ok: true });
 });
 
 /* ---------- STATS ---------- */
